@@ -49,4 +49,10 @@ class MethodChannelNoiseSuppressor extends NoiseSuppressorPlatform {
       await methodChannel.invokeMethod<void>('configure', args);
     }
   }
+
+  @override
+  Future<double> getAudioLevel() async {
+    final result = await methodChannel.invokeMethod<double>('getAudioLevel');
+    return result ?? 0.0;
+  }
 }

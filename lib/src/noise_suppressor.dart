@@ -95,4 +95,11 @@ class NoiseSuppressor {
       releaseMs: releaseMs,
     );
   }
+
+  /// Returns the RMS level of the most recently processed audio frame in
+  /// normalised float range [0, 1]. Returns 0.0 if no audio has been
+  /// processed yet or if the suppressor is not initialized.
+  static Future<double> getAudioLevel() {
+    return NoiseSuppressorPlatform.instance.getAudioLevel();
+  }
 }

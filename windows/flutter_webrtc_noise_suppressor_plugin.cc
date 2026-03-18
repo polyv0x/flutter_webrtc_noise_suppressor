@@ -172,6 +172,10 @@ void FlutterWebrtcNoiseSuppressorPlugin::HandleMethodCall(
 
     result->Success();
 
+  } else if (method == "getAudioLevel") {
+    float level = g_processor != nullptr ? g_processor->GetAudioLevel() : 0.0f;
+    result->Success(EncodableValue(static_cast<double>(level)));
+
   } else {
     result->NotImplemented();
   }

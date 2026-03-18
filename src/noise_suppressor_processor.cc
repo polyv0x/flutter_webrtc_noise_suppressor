@@ -33,6 +33,14 @@ void NoiseSuppressorProcessor::Initialize(int sample_rate_hz,
 
 void NoiseSuppressorProcessor::Process(int num_bands, int num_frames,
                                        int buffer_size, float* buffer) {
+  // Always compute and store RMS so GetAudioLevel() works for the settings meter.
+  if (buffer_size > 0) {
+    float sum_sq = 0.0f;
+    for (int i = 0; i < buffer_size; ++i) sum_sq += buffer[i] * buffer[i];
+    const float rms = std::sqrt(sum_sq / static_cast<float>(buffer_size));
+    rms_level_.store(rms, std::memory_order_relaxed);
+  }
+
   const int current_mode = mode_.load(std::memory_order_relaxed);
 
   // disabled: pass through unchanged.
@@ -72,12 +80,8 @@ void NoiseSuppressorProcessor::Process(int num_bands, int num_frames,
           ? std::exp(-spf_f / (release_ms_v * sr_f / 1000.0f))
           : 0.0f;
 
-  // Compute RMS over the entire buffer (all bands/channels interleaved).
-  float sum_sq = 0.0f;
-  for (int i = 0; i < buffer_size; ++i) {
-    sum_sq += buffer[i] * buffer[i];
-  }
-  const float rms = std::sqrt(sum_sq / static_cast<float>(buffer_size));
+  // RMS was already computed above; reload it for the gate logic.
+  const float rms = rms_level_.load(std::memory_order_relaxed);
 
   // Gate logic with hold timer.
   bool gate_open = false;
@@ -128,6 +132,10 @@ void NoiseSuppressorProcessor::Release() {
 // ---------------------------------------------------------------------------
 // Thread-safe setters
 // ---------------------------------------------------------------------------
+
+float NoiseSuppressorProcessor::GetAudioLevel() const {
+  return rms_level_.load(std::memory_order_relaxed);
+}
 
 void NoiseSuppressorProcessor::SetMode(int mode) {
   mode_.store(mode, std::memory_order_relaxed);

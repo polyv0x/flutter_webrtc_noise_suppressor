@@ -60,6 +60,10 @@ static const float kDefaultReleaseMs    = 80.0f;
 
     // Retain the proxy object we registered so we can remove it later.
     id      _processingProxy;
+
+    // Last computed RMS level — written on audio thread, read on main thread.
+    // Protected by @synchronized(self) for consistency with other ivars.
+    float   _rmsLevel;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +114,10 @@ static const float kDefaultReleaseMs    = 80.0f;
         [self handleSetMode:call result:result];
     } else if ([call.method isEqualToString:@"configure"]) {
         [self handleConfigure:call result:result];
+    } else if ([call.method isEqualToString:@"getAudioLevel"]) {
+        float level;
+        @synchronized(self) { level = _rmsLevel; }
+        result(@(level));
     } else {
         result(FlutterMethodNotImplemented);
     }
@@ -321,6 +329,7 @@ static const float kDefaultReleaseMs    = 80.0f;
         sumSq += ch0[i] * ch0[i];
     }
     float rms = sqrtf(sumSq / (float)n);
+    @synchronized(self) { _rmsLevel = rms; }
 
     // ------------------------------------------------------------------
     // Gate logic with hold.

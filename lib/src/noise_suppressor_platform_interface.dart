@@ -76,4 +76,11 @@ abstract class NoiseSuppressorPlatform extends PlatformInterface {
   }) {
     throw UnimplementedError('configure() has not been implemented.');
   }
+
+  /// Returns the RMS level of the most recently processed audio frame in
+  /// normalised float range [0, 1]. Returns 0.0 if no audio has been
+  /// processed yet.
+  Future<double> getAudioLevel() {
+    throw UnimplementedError('getAudioLevel() has not been implemented.');
+  }
 }

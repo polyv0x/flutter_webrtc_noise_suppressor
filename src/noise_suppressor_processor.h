@@ -63,6 +63,11 @@ class NoiseSuppressorProcessor
   /// Sets the active processing mode (see NoiseProcessingMode).
   void SetMode(int mode);
 
+  /// Returns the RMS level of the last processed audio frame, in the same
+  /// normalised float range [0, 1] as the threshold. Safe to call from any
+  /// thread (backed by an atomic store in Process()).
+  float GetAudioLevel() const;
+
   /// RMS energy threshold in normalised float range [0, 1].
   /// Frames with RMS below this value are treated as silence.
   /// Default: 0.02f.
@@ -88,6 +93,9 @@ class NoiseSuppressorProcessor
   // ---------------------------------------------------------------------------
   // Configuration atomics — written from the Dart/UI thread, read in Process().
   // ---------------------------------------------------------------------------
+
+  /// Last computed RMS level — written in Process(), readable from any thread.
+  std::atomic<float> rms_level_{0.0f};
 
   /// Current processing mode.
   std::atomic<int> mode_{static_cast<int>(NoiseProcessingMode::kDisabled)};

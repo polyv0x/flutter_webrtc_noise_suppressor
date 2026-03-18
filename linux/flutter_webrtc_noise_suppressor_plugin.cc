@@ -155,6 +155,11 @@ static void flutter_webrtc_noise_suppressor_plugin_handle_method_call(
           FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
     }
 
+  } else if (strcmp(method, "getAudioLevel") == 0) {
+    float level = g_processor != nullptr ? g_processor->GetAudioLevel() : 0.0f;
+    response = FL_METHOD_RESPONSE(
+        fl_method_success_response_new(fl_value_new_float(level)));
+
   } else {
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
   }

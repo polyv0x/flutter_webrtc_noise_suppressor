@@ -32,6 +32,9 @@ class RmsGateProcessor {
     @Volatile var attackMs: Float = 5.0f
     @Volatile var releaseMs: Float = 80.0f
 
+    // Last computed RMS level — written on the audio thread, readable from any thread.
+    @Volatile var lastRms: Float = 0.0f
+
     // Audio-thread state (touched only in initialize / process / reset).
     private var sampleRateHz: Int = 0
     private var channels: Int = 0
@@ -73,6 +76,7 @@ class RmsGateProcessor {
             sumSq += f * f
         }
         val rms = sqrt(sumSq / n.toFloat())
+        lastRms = rms
 
         // ------------------------------------------------------------------
         // Gate logic with hold
@@ -191,11 +195,12 @@ class FlutterWebrtcNoiseSuppressorPlugin : FlutterPlugin, MethodCallHandler {
 
     override fun onMethodCall(call: MethodCall, result: Result) {
         when (call.method) {
-            "initialize" -> handleInitialize(result)
-            "dispose"    -> handleDispose(result)
-            "setMode"    -> handleSetMode(call, result)
-            "configure"  -> handleConfigure(call, result)
-            else         -> result.notImplemented()
+            "initialize"    -> handleInitialize(result)
+            "dispose"       -> handleDispose(result)
+            "setMode"       -> handleSetMode(call, result)
+            "configure"     -> handleConfigure(call, result)
+            "getAudioLevel" -> result.success(processor?.lastRms?.toDouble() ?: 0.0)
+            else            -> result.notImplemented()
         }
     }
 
