@@ -1,0 +1,36 @@
+name: flutter_webrtc_noise_suppressor
+description: Real-time noise suppression for flutter_webrtc. Supports RMS gate, VAD-based gating (Silero), and AI denoising (DeepFilterNet3) via ONNX Runtime.
+version: 0.1.0
+homepage: https://github.com/polyv0x/flutter_webrtc_noise_suppressor
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_web_plugins:
+    sdk: flutter
+  plugin_platform_interface: ^2.1.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  plugin:
+    platforms:
+      linux:
+        pluginClass: FlutterWebrtcNoiseSuppressorPlugin
+      windows:
+        pluginClass: FlutterWebrtcNoiseSuppressorPlugin
+      android:
+        package: com.example.flutter_webrtc_noise_suppressor
+        pluginClass: FlutterWebrtcNoiseSuppressorPlugin
+      ios:
+        pluginClass: FlutterWebrtcNoiseSuppressorPlugin
+      web:
+        pluginClass: NoiseSuppressorWeb
+        fileName: lib/flutter_webrtc_noise_suppressor_web.dart
