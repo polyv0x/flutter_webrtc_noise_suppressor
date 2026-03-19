@@ -100,8 +100,13 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
   web.AudioContext? _audioContext;
   web.AudioWorkletNode? _workletNode;
   web.MediaStreamAudioSourceNode? _source;
+  web.MediaStreamAudioDestinationNode? _destNode;
   web.MediaStream? _sourceStream; // original getUserMedia stream — kept alive so iOS doesn't kill the mic track
   double _lastLevel = 0.0;
+
+  // Stored listeners so we can remove them cleanly (fix Issues 1 & 2).
+  JSFunction? _stateChangeListener;
+  JSFunction? _portMessageListener;
 
   // getUserMedia patch state
   JSObject? _mediaDevicesJS;
@@ -130,13 +135,24 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
       web.URL.revokeObjectURL(blobUrl);
     }
 
+    // Register the statechange listener once here so it is never duplicated
+    // across multiple _processStreamAsync calls (fix Issue 1).
+    final ctx = _audioContext!;
+    _stateChangeListener = (() {
+      if (ctx.state == 'suspended') {
+        try { ctx.resume(); } catch (_) {}
+      }
+    }).toJS;
+    ctx.addEventListener('statechange', _stateChangeListener!);
+
     _patchGetUserMedia();
-    _requestAudioSession();
   }
 
   // Request the play-and-record audio session type so iOS keeps the AVAudioSession
   // active for microphone capture even when the audio graph has no speaker output.
   // navigator.audioSession is available in Safari 16.4+ and reliable from iOS 17.5+.
+  // Called inside the patched getUserMedia closure (fix Issue 6) so it runs
+  // synchronously within the user-gesture call stack on every audio capture.
   void _requestAudioSession() {
     try {
       final nav = (web.window as JSObject).getProperty('navigator'.toJS) as JSObject;
@@ -172,12 +188,22 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
           .callMethod('call'.toJS, self._mediaDevicesJS, constraints)
               as JSPromise<JSObject>;
 
-      // Only wrap streams that have audio.
+      // Only wrap streams that have audio. Guard against {audio: false}
+      // by checking the value is truthy, not just present (fix Issue 7).
       final audio = constraints is JSObject
           ? (constraints as JSObject).getProperty('audio'.toJS)
           : null;
-      final hasAudio = audio != null && !audio.typeofEquals('undefined');
-      if (!hasAudio) return origPromise;
+      final hasAudio = audio != null &&
+          !audio.typeofEquals('undefined') &&
+          !audio.typeofEquals('boolean');
+      // Also allow audio: true (boolean true)
+      final isAudioTrue = audio != null &&
+          audio.typeofEquals('boolean') &&
+          (audio as JSBoolean).toDart;
+      if (!hasAudio && !isAudioTrue) return origPromise;
+
+      // Set audioSession type synchronously in the gesture context (fix Issue 6).
+      self._requestAudioSession();
 
       // Chain: origPromise → _processStreamAsync → new Promise
       return origPromise.toDart
@@ -196,8 +222,8 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
   }
 
   // Process one getUserMedia stream: source → workletNode → destination.
-  // Replaces the original audio track in the stream in-place so the caller
-  // (dart_webrtc / RTCPeerConnection) gets the gated track automatically.
+  // Returns a new MediaStream with the processed audio track so the original
+  // stream is never mutated (keeping iOS mic hardware alive via _sourceStream).
   Future<JSObject> _processStreamAsync(JSObject rawStream) async {
     try {
       final ctx = _audioContext;
@@ -207,7 +233,8 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
       final audioTracks = ms.getAudioTracks().toDart;
       if (audioTracks.isEmpty) return rawStream;
 
-      // Disconnect any previous worklet and release previous source stream.
+      // Disconnect any previous worklet graph (but keep mic tracks alive —
+      // track stopping only happens in dispose, fix Issue 4).
       _disconnectWorklet();
 
       // Keep the original stream alive as an instance variable. If we were to
@@ -223,39 +250,29 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
       final workletNode = web.AudioWorkletNode(ctx, _processorName);
       _workletNode = workletNode;
 
-      final destNode = ctx.createMediaStreamDestination();
+      // Store destNode so we can disconnect it on cleanup (fix Issue 3).
+      _destNode = ctx.createMediaStreamDestination();
 
       _source!.connect(workletNode);
-      workletNode.connect(destNode);
+      workletNode.connect(_destNode!);
 
-      // Re-resume if iOS suspends the context after backgrounding and returning.
-      ctx.addEventListener(
-        'statechange',
-        (() {
-          if (ctx.state == 'suspended') {
-            try { ctx.resume(); } catch (_) {}
-          }
-        }).toJS,
-      );
-
-      // Receive peak-level updates from the worklet.
-      workletNode.port.addEventListener(
-        'message',
-        ((web.MessageEvent e) {
-          final data = e.data;
-          if (data != null) {
-            try {
-              _lastLevel = (data as JSNumber).toDartDouble;
-            } catch (_) {}
-          }
-        }).toJS,
-      );
+      // Receive peak-level updates from the worklet. Store the listener so
+      // we can remove it when the worklet is disconnected (fix Issue 2).
+      _portMessageListener = ((web.MessageEvent e) {
+        final data = e.data;
+        if (data != null) {
+          try {
+            _lastLevel = (data as JSNumber).toDartDouble;
+          } catch (_) {}
+        }
+      }).toJS;
+      workletNode.port.addEventListener('message', _portMessageListener!);
       workletNode.port.start();
 
       // Return a new stream containing only the processed track. We do NOT
       // modify the original stream (ms) since removing its mic track would
       // break the _sourceStream reference keeping iOS's mic hardware alive.
-      final processedTracks = destNode.stream.getAudioTracks().toDart;
+      final processedTracks = _destNode!.stream.getAudioTracks().toDart;
       if (processedTracks.isNotEmpty) {
         final outStream = web.MediaStream();
         // Copy any video tracks from the original stream.
@@ -275,15 +292,27 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
     }
   }
 
+  // Disconnect and release the audio graph nodes. Does NOT stop mic tracks —
+  // that is only done in dispose() so callers don't lose the mic (fix Issue 4).
   void _disconnectWorklet() {
+    // Remove the port message listener before nulling the node (fix Issue 2).
+    if (_workletNode != null && _portMessageListener != null) {
+      try {
+        _workletNode!.port.removeEventListener('message', _portMessageListener!);
+      } catch (_) {}
+      _portMessageListener = null;
+    }
+
     try { (_source as JSObject?)?.callMethod('disconnect'.toJS); } catch (_) {}
     _source = null;
-    try {
-      _sourceStream?.getTracks().toDart.forEach((t) => t.stop());
-    } catch (_) {}
-    _sourceStream = null;
-    try { (_workletNode! as JSObject).callMethod('disconnect'.toJS); } catch (_) {}
+
+    try { (_workletNode as JSObject?)?.callMethod('disconnect'.toJS); } catch (_) {}
     _workletNode = null;
+
+    try { (_destNode as JSObject?)?.callMethod('disconnect'.toJS); } catch (_) {}
+    _destNode = null;
+
+    // Keep _sourceStream alive — only cleared in dispose().
   }
 
   // ---------------------------------------------------------------------------
@@ -293,7 +322,21 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
   Future<void> dispose() async {
     _unpatchGetUserMedia();
     _disconnectWorklet();
+
+    // Stop mic tracks now that we are fully tearing down (fix Issue 4).
+    try {
+      _sourceStream?.getTracks().toDart.forEach((t) => t.stop());
+    } catch (_) {}
+    _sourceStream = null;
+
     if (_audioContext != null) {
+      // Remove the statechange listener registered in initialize (fix Issue 1).
+      if (_stateChangeListener != null) {
+        try {
+          _audioContext!.removeEventListener('statechange', _stateChangeListener!);
+        } catch (_) {}
+        _stateChangeListener = null;
+      }
       try {
         await _audioContext!.close().toDart;
       } catch (_) {}
@@ -335,6 +378,8 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
 
   void _postToWorklet(Map<String, dynamic> data) {
     if (_workletNode == null || data.isEmpty) return;
-    _workletNode!.port.postMessage(data.jsify());
+    final payload = data.jsify();
+    if (payload == null) return;
+    _workletNode?.port.postMessage(payload);
   }
 }
