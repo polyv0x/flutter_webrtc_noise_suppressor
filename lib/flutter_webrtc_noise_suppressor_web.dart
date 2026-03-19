@@ -1,9 +1,8 @@
 /// Web implementation of flutter_webrtc_noise_suppressor.
 ///
 /// Uses an AudioWorklet for sample-accurate gate processing and patches
-/// navigator.mediaDevices.getUserMedia so that every captured audio track
-/// is routed through the gate transparently, regardless of which package
-/// (dart_webrtc / flutter_webrtc) calls getUserMedia.
+/// navigator.mediaDevices.getUserMedia via Dart JS interop so that every
+/// captured audio track is routed through the gate transparently.
 library flutter_webrtc_noise_suppressor_web;
 
 import 'dart:async';
@@ -17,8 +16,7 @@ import 'src/noise_processing_mode.dart';
 import 'src/noise_suppressor_platform_interface.dart';
 
 // ---------------------------------------------------------------------------
-// AudioWorklet processor source — inlined so no separate web asset is needed.
-// Loaded at runtime via a Blob URL.
+// AudioWorklet processor — inlined so no separate web asset is needed.
 // ---------------------------------------------------------------------------
 const String _kWorkletSource = r'''
 class NoiseGateProcessor extends AudioWorkletProcessor {
@@ -50,9 +48,8 @@ class NoiseGateProcessor extends AudioWorkletProcessor {
     if (!input || !input.length || !input[0].length) return true;
 
     const numChannels = input.length;
-    const numSamples  = input[0].length; // 128 at AudioContext sample rate
+    const numSamples  = input[0].length;
 
-    // Short-term peak across all channels.
     let peak = 0;
     for (let c = 0; c < numChannels; c++) {
       const ch = input[c];
@@ -71,13 +68,11 @@ class NoiseGateProcessor extends AudioWorkletProcessor {
       }
       const gateOpen = peak >= this._threshold || this._holdSamplesRemaining > 0;
       const target   = gateOpen ? 1.0 : this._residualGain;
-
-      const atkCoeff = Math.exp(-numSamples / (this._attackMs  * sampleRate / 1000));
-      const relCoeff = Math.exp(-numSamples / (this._releaseMs * sampleRate / 1000));
-      const coeff    = target > this._smoothedGain ? atkCoeff : relCoeff;
+      const atkC = Math.exp(-numSamples / (this._attackMs  * sampleRate / 1000));
+      const relC = Math.exp(-numSamples / (this._releaseMs * sampleRate / 1000));
+      const coeff = target > this._smoothedGain ? atkC : relC;
       this._smoothedGain += (1 - coeff) * (target - this._smoothedGain);
       this._smoothedGain  = Math.max(0, Math.min(1, this._smoothedGain));
-
       for (let c = 0; c < numChannels; c++) {
         const ich = input[c], och = output[c];
         for (let i = 0; i < numSamples; i++) och[i] = ich[i] * this._smoothedGain;
@@ -86,7 +81,6 @@ class NoiseGateProcessor extends AudioWorkletProcessor {
       for (let c = 0; c < numChannels; c++) output[c].set(input[c]);
     }
 
-    // Post peak level ~every 50 ms for the settings meter.
     this._levelFrameCount += numSamples;
     if (this._levelFrameCount >= sampleRate * 0.05) {
       this._levelFrameCount = 0;
@@ -98,45 +92,6 @@ class NoiseGateProcessor extends AudioWorkletProcessor {
 registerProcessor('noise-gate-processor', NoiseGateProcessor);
 ''';
 
-// ---------------------------------------------------------------------------
-// getUserMedia patch — injected once as a <script> element.
-// Dart calls window.__noiseGatePatch.activate(hook) / deactivate().
-// ---------------------------------------------------------------------------
-const String _kPatchScript = '''
-(function () {
-  if (window.__noiseGatePatch) return;
-  var orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-  var hook = null;
-  window.__noiseGatePatch = {
-    activate: function (fn) {
-      hook = fn;
-      navigator.mediaDevices.getUserMedia = function (constraints) {
-        var p = orig(constraints);
-        if (hook && constraints && constraints.audio) {
-          return p.then(function (stream) { return hook(stream); });
-        }
-        return p;
-      };
-    },
-    deactivate: function () {
-      navigator.mediaDevices.getUserMedia = orig;
-      hook = null;
-    }
-  };
-})();
-''';
-
-// ---------------------------------------------------------------------------
-// Extension types for APIs not fully surfaced in package:web
-// ---------------------------------------------------------------------------
-extension type _NoiseGatePatch(JSObject _) implements JSObject {
-  external void activate(JSFunction hook);
-  external void deactivate();
-}
-
-// ---------------------------------------------------------------------------
-// Web plugin implementation
-// ---------------------------------------------------------------------------
 class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
   static void registerWith(Registrar registrar) {
     NoiseSuppressorPlatform.instance = NoiseSuppressorWeb();
@@ -145,6 +100,10 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
   web.AudioContext? _audioContext;
   web.AudioWorkletNode? _workletNode;
   double _lastLevel = 0.0;
+
+  // getUserMedia patch state
+  JSObject? _mediaDevicesJS;
+  JSAny? _originalGetUserMediaJS;
 
   static const String _processorName = 'noise-gate-processor';
 
@@ -155,78 +114,122 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
   Future<void> initialize() async {
     if (_audioContext != null) return;
 
-    // Inject the getUserMedia patch script once.
-    final script = web.HTMLScriptElement();
-    script.text = _kPatchScript;
-    web.document.head!.append(script);
-
-    // Build AudioContext and load the worklet via a Blob URL.
     _audioContext = web.AudioContext();
 
+    // Load worklet via a Blob URL so no separate asset file is needed.
     final blob = web.Blob(
       [_kWorkletSource.toJS].toJS,
       web.BlobPropertyBag(type: 'application/javascript'),
     );
     final blobUrl = web.URL.createObjectURL(blob);
-    await _audioContext!.audioWorklet.addModule(blobUrl).toDart;
-    web.URL.revokeObjectURL(blobUrl);
+    try {
+      await _audioContext!.audioWorklet.addModule(blobUrl).toDart;
+    } finally {
+      web.URL.revokeObjectURL(blobUrl);
+    }
 
-    // Activate the getUserMedia hook.
-    final patch = (web.window as JSObject)
-        .getProperty('__noiseGatePatch'.toJS) as _NoiseGatePatch;
-    patch.activate(((JSObject s) => _processStreamAsync(s).toJS).toJS);
+    _patchGetUserMedia();
   }
 
-  // Called from JS (via the getUserMedia patch) for every audio stream.
-  // Returns a JSPromise so the .then() chain in the patch script resolves correctly.
+  // Patch navigator.mediaDevices.getUserMedia directly via JS interop —
+  // no <script> injection needed so no CSP issues.
+  void _patchGetUserMedia() {
+    if (_mediaDevicesJS != null) return; // already patched
+
+    final nav = (web.window as JSObject).getProperty('navigator'.toJS) as JSObject;
+    _mediaDevicesJS = nav.getProperty('mediaDevices'.toJS) as JSObject;
+    _originalGetUserMediaJS = _mediaDevicesJS!.getProperty('getUserMedia'.toJS);
+
+    // Build the replacement function. It calls the original, then runs the
+    // stream through our AudioWorklet graph if audio is requested.
+    final self = this;
+    final patched = ((JSObject constraints) {
+      // Call original getUserMedia with the correct `this`.
+      final origPromise = (self._originalGetUserMediaJS as JSObject)
+          .callMethod('call'.toJS, [self._mediaDevicesJS, constraints].toJS)
+              as JSPromise<JSObject>;
+
+      // Only wrap streams that have audio.
+      final audio = (constraints).getProperty('audio'.toJS);
+      final hasAudio = audio != null && !audio.typeofEquals('undefined');
+      if (!hasAudio) return origPromise;
+
+      // Chain: origPromise → _processStreamAsync → new Promise
+      return origPromise.toDart
+          .then((stream) => self._processStreamAsync(stream))
+          .toJS;
+    }).toJS;
+
+    _mediaDevicesJS!.setProperty('getUserMedia'.toJS, patched);
+  }
+
+  void _unpatchGetUserMedia() {
+    if (_mediaDevicesJS == null || _originalGetUserMediaJS == null) return;
+    _mediaDevicesJS!.setProperty('getUserMedia'.toJS, _originalGetUserMediaJS!);
+    _mediaDevicesJS = null;
+    _originalGetUserMediaJS = null;
+  }
+
+  // Process one getUserMedia stream: source → workletNode → destination.
+  // Replaces the original audio track in the stream in-place so the caller
+  // (dart_webrtc / RTCPeerConnection) gets the gated track automatically.
   Future<JSObject> _processStreamAsync(JSObject rawStream) async {
-    final ctx = _audioContext;
-    if (ctx == null) return rawStream;
+    try {
+      final ctx = _audioContext;
+      if (ctx == null) return rawStream;
 
-    final ms = rawStream as web.MediaStream;
-    final audioTracks = ms.getAudioTracks().toDart;
-    if (audioTracks.isEmpty) return rawStream;
+      final ms = rawStream as web.MediaStream;
+      final audioTracks = ms.getAudioTracks().toDart;
+      if (audioTracks.isEmpty) return rawStream;
 
-    // Disconnect any previously wired worklet node.
-    if (_workletNode != null) {
-      try {
-        (_workletNode! as JSObject).callMethod('disconnect'.toJS);
-      } catch (_) {}
+      // Disconnect any previous worklet.
+      _disconnectWorklet();
+
+      final source      = ctx.createMediaStreamSource(ms);
+      final workletNode = web.AudioWorkletNode(ctx, _processorName);
+      _workletNode = workletNode;
+
+      final destNode = ctx.createMediaStreamDestination();
+
+      source.connect(workletNode);
+      workletNode.connect(destNode);
+
+      // Receive peak-level updates from the worklet.
+      workletNode.port.addEventListener(
+        'message',
+        ((web.MessageEvent e) {
+          final data = e.data;
+          if (data != null) {
+            try {
+              _lastLevel = (data as JSNumber).toDartDouble;
+            } catch (_) {}
+          }
+        }).toJS,
+      );
+      workletNode.port.start();
+
+      // Replace original audio track with the processed one in-place.
+      final processedTracks = destNode.stream.getAudioTracks().toDart;
+      if (processedTracks.isNotEmpty) {
+        ms.removeTrack(audioTracks.first);
+        ms.addTrack(processedTracks.first);
+      }
+
+      return rawStream;
+    } catch (e) {
+      // If worklet setup fails, return the original stream unprocessed.
+      // Level meter won't work but the call / monitor will still function.
+      print('flutter_webrtc_noise_suppressor: web processing error: $e');
+      return rawStream;
     }
+  }
 
-    // source → workletNode → destination
-    final source      = ctx.createMediaStreamSource(ms);
-    final workletNode = web.AudioWorkletNode(ctx, _processorName);
-    _workletNode = workletNode;
-
-    final destNode = ctx.createMediaStreamDestination();
-
-    source.connect(workletNode);
-    workletNode.connect(destNode);
-
-    // Receive peak-level updates from the worklet.
-    workletNode.port.addEventListener(
-      'message',
-      ((web.MessageEvent e) {
-        final data = e.data;
-        if (data != null) {
-          try {
-            _lastLevel = (data as JSNumber).toDartDouble;
-          } catch (_) {}
-        }
-      }).toJS,
-    );
-    workletNode.port.start();
-
-    // Replace the original audio track with the processed one in-place so
-    // dart_webrtc / RTCPeerConnection receive the gated track automatically.
-    final processedTracks = destNode.stream.getAudioTracks().toDart;
-    if (processedTracks.isNotEmpty) {
-      ms.removeTrack(audioTracks.first);
-      ms.addTrack(processedTracks.first);
-    }
-
-    return rawStream;
+  void _disconnectWorklet() {
+    if (_workletNode == null) return;
+    try {
+      (_workletNode! as JSObject).callMethod('disconnect'.toJS);
+    } catch (_) {}
+    _workletNode = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -234,21 +237,8 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
   // ---------------------------------------------------------------------------
   @override
   Future<void> dispose() async {
-    final patch = (web.window as JSObject)
-        .getProperty('__noiseGatePatch'.toJS);
-    if (patch != null) {
-      try {
-        (patch as _NoiseGatePatch).deactivate();
-      } catch (_) {}
-    }
-
-    if (_workletNode != null) {
-      try {
-        (_workletNode! as JSObject).callMethod('disconnect'.toJS);
-      } catch (_) {}
-      _workletNode = null;
-    }
-
+    _unpatchGetUserMedia();
+    _disconnectWorklet();
     if (_audioContext != null) {
       try {
         await _audioContext!.close().toDart;
