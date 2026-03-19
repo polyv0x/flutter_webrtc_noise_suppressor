@@ -37,7 +37,7 @@ static noise_suppressor::NoiseSuppressorProcessor* g_processor = nullptr;
 // normalising the signal to near 1.0 regardless of actual loudness. To give
 // the noise gate (and level meter) access to the raw signal, we open a
 // separate low-latency PulseAudio stream from the default input source.
-// The computed RMS is injected into the processor via SetExternalLevel() so
+// The short-term peak (max absolute sample) is injected into the processor via SetExternalLevel() so
 // both the meter display and the gate threshold comparison use pre-AGC values.
 // ---------------------------------------------------------------------------
 
@@ -84,12 +84,14 @@ static void pa_monitor_thread_func() {
   while (g_pa_running.load(std::memory_order_relaxed)) {
     if (pa_simple_read(pa, buf, sizeof(buf), &error) < 0) break;
 
-    float sum_sq = 0.0f;
-    for (int i = 0; i < kFrameSamples; ++i) sum_sq += buf[i] * buf[i];
-    const float rms = std::sqrt(sum_sq / kFrameSamples);
+    float peak = 0.0f;
+    for (int i = 0; i < kFrameSamples; ++i) {
+      const float s = std::abs(buf[i]);
+      if (s > peak) peak = s;
+    }
 
     if (g_processor != nullptr) {
-      g_processor->SetExternalLevel(rms);
+      g_processor->SetExternalLevel(peak);
     }
   }
 
