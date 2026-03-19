@@ -143,14 +143,17 @@ class NoiseSuppressorWeb extends NoiseSuppressorPlatform {
     // Build the replacement function. It calls the original, then runs the
     // stream through our AudioWorklet graph if audio is requested.
     final self = this;
-    final patched = ((JSObject constraints) {
+    final patched = ((JSAny? constraints) {
       // Call original getUserMedia with the correct `this`.
+      // callMethod('call', thisArg, arg1) → fn.call(thisArg, arg1)
       final origPromise = (self._originalGetUserMediaJS as JSObject)
-          .callMethod('call'.toJS, [self._mediaDevicesJS, constraints].toJS)
+          .callMethod('call'.toJS, self._mediaDevicesJS, constraints)
               as JSPromise<JSObject>;
 
       // Only wrap streams that have audio.
-      final audio = (constraints).getProperty('audio'.toJS);
+      final audio = constraints is JSObject
+          ? (constraints as JSObject).getProperty('audio'.toJS)
+          : null;
       final hasAudio = audio != null && !audio.typeofEquals('undefined');
       if (!hasAudio) return origPromise;
 
