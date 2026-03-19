@@ -34,4 +34,4 @@ flutter:
         pluginClass: FlutterWebrtcNoiseSuppressorPlugin
       web:
         pluginClass: NoiseSuppressorWeb
-        fileName: lib/flutter_webrtc_noise_suppressor_web.dart
+        fileName: flutter_webrtc_noise_suppressor_web.dart
