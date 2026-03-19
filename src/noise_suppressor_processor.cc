@@ -80,8 +80,10 @@ void NoiseSuppressorProcessor::Process(int num_bands, int num_frames,
           ? std::exp(-spf_f / (release_ms_v * sr_f / 1000.0f))
           : 0.0f;
 
-  // RMS was already computed above; reload it for the gate logic.
-  const float rms = rms_level_.load(std::memory_order_relaxed);
+  // Use the external pre-APM level if available (e.g. from PulseAudio monitor
+  // thread on Linux), otherwise fall back to the post-APM RMS computed above.
+  const float ext = external_level_.load(std::memory_order_relaxed);
+  const float rms = (ext >= 0.0f) ? ext : rms_level_.load(std::memory_order_relaxed);
 
   // Gate logic with hold timer.
   bool gate_open = false;
@@ -134,7 +136,12 @@ void NoiseSuppressorProcessor::Release() {
 // ---------------------------------------------------------------------------
 
 float NoiseSuppressorProcessor::GetAudioLevel() const {
-  return rms_level_.load(std::memory_order_relaxed);
+  const float ext = external_level_.load(std::memory_order_relaxed);
+  return (ext >= 0.0f) ? ext : rms_level_.load(std::memory_order_relaxed);
+}
+
+void NoiseSuppressorProcessor::SetExternalLevel(float rms) {
+  external_level_.store(rms, std::memory_order_relaxed);
 }
 
 void NoiseSuppressorProcessor::SetMode(int mode) {

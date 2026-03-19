@@ -9,8 +9,16 @@
 
 #include "noise_suppressor_processor.h"
 
+#include <atomic>
+#include <cmath>
 #include <memory>
 #include <cstring>
+#include <thread>
+
+// PulseAudio simple API — used to capture raw pre-APM audio for level
+// metering and gate decisions, bypassing WebRTC's GainController2.
+#include <pulse/simple.h>
+#include <pulse/error.h>
 
 #define FLUTTER_WEBRTC_NOISE_SUPPRESSOR_PLUGIN(obj)                          \
   (G_TYPE_CHECK_INSTANCE_CAST((obj),                                         \
@@ -21,6 +29,83 @@
 // Processor singleton — lives for the duration of the plugin registration.
 // ---------------------------------------------------------------------------
 static noise_suppressor::NoiseSuppressorProcessor* g_processor = nullptr;
+
+// ---------------------------------------------------------------------------
+// PulseAudio pre-APM level monitor thread
+//
+// WebRTC's APM runs GainController2 before our SetCapturePostProcessing hook,
+// normalising the signal to near 1.0 regardless of actual loudness. To give
+// the noise gate (and level meter) access to the raw signal, we open a
+// separate low-latency PulseAudio stream from the default input source.
+// The computed RMS is injected into the processor via SetExternalLevel() so
+// both the meter display and the gate threshold comparison use pre-AGC values.
+// ---------------------------------------------------------------------------
+
+static std::thread             g_pa_thread;
+static std::atomic<bool>       g_pa_running{false};
+
+static void pa_monitor_thread_func() {
+  const pa_sample_spec ss = {
+      PA_SAMPLE_FLOAT32NE,
+      16000,   // 16 kHz — more than enough for level metering
+      1        // mono
+  };
+
+  // Request a small buffer (~20 ms) so the thread responds quickly to stop.
+  const pa_buffer_attr ba = {
+      static_cast<uint32_t>(-1),  // maxlength — let server choose
+      static_cast<uint32_t>(-1),  // tlength    (playback only)
+      static_cast<uint32_t>(-1),  // prebuf     (playback only)
+      static_cast<uint32_t>(-1),  // minreq     (playback only)
+      static_cast<uint32_t>(16000 / 50 * sizeof(float)),  // fragsize: 20 ms
+  };
+
+  int error = 0;
+  pa_simple* pa = pa_simple_new(
+      nullptr,                              // default PA server
+      "flutter_webrtc_noise_suppressor",    // application name
+      PA_STREAM_RECORD,
+      nullptr,                              // default source (same as WebRTC)
+      "noise gate level monitor",
+      &ss,
+      nullptr,                              // default channel map
+      &ba,
+      &error);
+
+  if (!pa) {
+    // PulseAudio unavailable — gate and meter fall back to post-APM level.
+    return;
+  }
+
+  // 20 ms frames at 16 kHz = 320 samples.
+  constexpr int kFrameSamples = 320;
+  float buf[kFrameSamples];
+
+  while (g_pa_running.load(std::memory_order_relaxed)) {
+    if (pa_simple_read(pa, buf, sizeof(buf), &error) < 0) break;
+
+    float sum_sq = 0.0f;
+    for (int i = 0; i < kFrameSamples; ++i) sum_sq += buf[i] * buf[i];
+    const float rms = std::sqrt(sum_sq / kFrameSamples);
+
+    if (g_processor != nullptr) {
+      g_processor->SetExternalLevel(rms);
+    }
+  }
+
+  pa_simple_free(pa);
+}
+
+static void start_pa_monitor() {
+  if (g_pa_running.exchange(true)) return;  // already running
+  g_pa_thread = std::thread(pa_monitor_thread_func);
+}
+
+static void stop_pa_monitor() {
+  g_pa_running.store(false, std::memory_order_relaxed);
+  if (g_pa_thread.joinable()) g_pa_thread.join();
+  if (g_processor != nullptr) g_processor->SetExternalLevel(-1.0f);
+}
 
 // ---------------------------------------------------------------------------
 // GObject plugin type
@@ -66,10 +151,10 @@ static void flutter_webrtc_noise_suppressor_plugin_handle_method_call(
     }
 
     // Register the processor with flutter_webrtc's audio processing pipeline.
-    // flutter_webrtc_add_audio_processor is declared in
-    // flutter_webrtc/flutter_webrtc_audio_processing.h and provided by
-    // libflutter_webrtc_plugin.so.
     flutter_webrtc_add_audio_processor(g_processor);
+
+    // Start the PulseAudio pre-APM level monitor thread.
+    start_pa_monitor();
 
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
 
@@ -80,6 +165,7 @@ static void flutter_webrtc_noise_suppressor_plugin_handle_method_call(
           "dispose() called before initialize()",
           nullptr));
     } else {
+      stop_pa_monitor();
       flutter_webrtc_remove_audio_processor(g_processor);
       delete g_processor;
       g_processor = nullptr;

@@ -63,10 +63,22 @@ class NoiseSuppressorProcessor
   /// Sets the active processing mode (see NoiseProcessingMode).
   void SetMode(int mode);
 
-  /// Returns the RMS level of the last processed audio frame, in the same
-  /// normalised float range [0, 1] as the threshold. Safe to call from any
-  /// thread (backed by an atomic store in Process()).
+  /// Returns the audio level used for metering and gate decisions.
+  ///
+  /// If an external pre-APM level has been supplied via SetExternalLevel()
+  /// (e.g. from a PulseAudio monitor thread), that value is returned so the
+  /// meter and gate reflect the raw signal before WebRTC's AGC normalises it.
+  /// Otherwise falls back to the post-APM RMS computed in Process().
   float GetAudioLevel() const;
+
+  /// Injects a pre-APM RMS level from an external source (e.g. a PulseAudio
+  /// capture thread that reads raw audio before WebRTC's gain controller runs).
+  /// When set (value >= 0), this level is used for both GetAudioLevel() and
+  /// the gate threshold comparison inside Process(), replacing the post-APM RMS.
+  ///
+  /// Pass -1.0f to clear and revert to post-APM measurement.
+  /// Safe to call from any thread.
+  void SetExternalLevel(float rms);
 
   /// RMS energy threshold in normalised float range [0, 1].
   /// Frames with RMS below this value are treated as silence.
@@ -94,8 +106,12 @@ class NoiseSuppressorProcessor
   // Configuration atomics — written from the Dart/UI thread, read in Process().
   // ---------------------------------------------------------------------------
 
-  /// Last computed RMS level — written in Process(), readable from any thread.
+  /// Last computed post-APM RMS level — written in Process(), readable from any thread.
   std::atomic<float> rms_level_{0.0f};
+
+  /// Pre-APM level injected by an external source (e.g. PulseAudio thread).
+  /// Negative = not set; gate and meter use rms_level_ instead.
+  std::atomic<float> external_level_{-1.0f};
 
   /// Current processing mode.
   std::atomic<int> mode_{static_cast<int>(NoiseProcessingMode::kDisabled)};

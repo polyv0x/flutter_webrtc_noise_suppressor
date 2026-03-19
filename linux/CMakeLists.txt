@@ -27,8 +27,16 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 #   - flutter_webrtc/flutter_webrtc_audio_processing.h (the registration API)
 #   - libwebrtc headers transitively (rtc_audio_processing.h etc.)
 # GTK is required by flutter_linux.
+# libpulse-simple is used for pre-APM audio level monitoring, bypassing
+# WebRTC's GainController2 so the noise gate sees the raw mic level.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBPULSE REQUIRED libpulse-simple)
+
+target_include_directories(${PLUGIN_NAME} PRIVATE ${LIBPULSE_INCLUDE_DIRS})
+
 target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   PkgConfig::GTK
   flutter_webrtc_plugin
+  ${LIBPULSE_LIBRARIES}
 )
