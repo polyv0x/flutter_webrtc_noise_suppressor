@@ -16,6 +16,8 @@ target_compile_definitions(${PLUGIN_NAME} PRIVATE
   FLUTTER_PLUGIN_IMPL
   # Required by libwebrtc on Windows to use the correct DLL import attributes.
   LIB_WEBRTC_API_DLL
+  # Prevent windows.h from defining min/max macros that clash with std::min/std::max.
+  NOMINMAX
 )
 
 target_include_directories(${PLUGIN_NAME} PRIVATE
