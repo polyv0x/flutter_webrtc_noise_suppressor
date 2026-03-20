@@ -20,9 +20,11 @@ target_compile_definitions(${PLUGIN_NAME} PRIVATE
   NOMINMAX
 )
 
-target_include_directories(${PLUGIN_NAME} PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../src"
+target_include_directories(${PLUGIN_NAME}
+  INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src"
 )
 
 # flutter_webrtc_plugin provides:
